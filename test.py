@@ -12,7 +12,19 @@ HOP       = 128
 EPS       = 1e-9
 N_MFCC    = 13
 N_FILTERS = 26
-K         = 7    # neighbours to consider (odd number avoids ties)
+K         = 7
+
+# Goertzel probe frequencies (Hz) — chosen for your 10 words
+# Covers F1/F2 formants, nasal band, fricative band, plosive burst
+GOERTZEL_FREQS = [
+    250,  350,  450,   # F1 low  (on/off/stop/close/open)
+    550,  700,  850,   # F1 mid  (up/down/start)
+    1000, 1200, 1500,  # F1-F2 transition
+    1800, 2100, 2500,  # F2 front vowels (left/right)
+    3000, 4000,        # F3 + consonant resonance
+    5500, 7000,        # fricative energy (off/stop)
+]
+GOERTZEL_W = 3.0   # weight multiplier vs MFCCs — tune this
 
 templates = np.load("templates_dtw.npy", allow_pickle=True)
 labels    = np.load("labels_dtw.npy",    allow_pickle=True)
@@ -43,26 +55,75 @@ _DCT = np.array([
 ], dtype=np.float32)
 
 # ---------------------------------------------------
-# FEATURE EXTRACTION
+# GOERTZEL ALGORITHM
+# Single-frequency DFT — efficient energy detector
+# at exact target frequencies.
 # ---------------------------------------------------
-def extract_mfcc_seq(y):
-    y = y.flatten() / (np.max(np.abs(y)) + EPS)
-    frames = [y[i:i+FRAME_LEN] for i in range(0, len(y) - FRAME_LEN + 1, HOP)]
-    seq = []
-    for f in frames:
-        mag   = np.abs(np.fft.rfft(f))
-        mel_e = _FB @ (mag ** 2)
-        seq.append(_DCT @ np.log(mel_e + EPS))
-    seq = np.array(seq, dtype=np.float32)
-    seq -= np.mean(seq, axis=0, keepdims=True)      # CMN
-    n     = seq.shape[0]
-    delta = np.zeros_like(seq)
-    for t in range(n):
-        delta[t] = (seq[min(t+1, n-1)] - seq[max(t-1, 0)]) / 2.0
-    return np.concatenate([seq, delta], axis=1)     # (n_frames, 26)
+def goertzel(frame, freq, sr):
+    """Return energy at `freq` Hz for a single frame."""
+    N      = len(frame)
+    k      = int(round(freq * N / sr))
+    k      = min(k, N - 1)
+    w      = 2.0 * np.pi * k / N
+    coeff  = 2.0 * np.cos(w)
+    s_prev = 0.0
+    s_prev2= 0.0
+    for x in frame:
+        s = x + coeff * s_prev - s_prev2
+        s_prev2 = s_prev
+        s_prev  = s
+    power = s_prev2**2 + s_prev**2 - coeff * s_prev * s_prev2
+    return max(power, 0.0)
+
+def goertzel_frame(frame, freqs, sr):
+    """Return log-energy vector for all probe frequencies."""
+    energies = np.array([goertzel(frame, f, sr) for f in freqs], dtype=np.float32)
+    return np.log(energies + EPS)
 
 # ---------------------------------------------------
-# DTW  — Sakoe-Chiba band
+# FEATURE EXTRACTION
+# Returns (n_frames, 26 + n_goertzel) sequence
+#   cols 0..25          : MFCC + delta  (weight 1.0)
+#   cols 26..           : Goertzel log-energies × GOERTZEL_W
+# ---------------------------------------------------
+def extract_seq(y):
+    y = y.flatten() / (np.max(np.abs(y)) + EPS)
+    frames = [y[i:i+FRAME_LEN] for i in range(0, len(y) - FRAME_LEN + 1, HOP)]
+
+    mfcc_seq = []
+    goertzel_seq = []
+
+    for f in frames:
+        # --- MFCC ---
+        mag   = np.abs(np.fft.rfft(f))
+        mel_e = _FB @ (mag ** 2)
+        mfcc_seq.append(_DCT @ np.log(mel_e + EPS))
+
+        # --- Goertzel ---
+        goertzel_seq.append(goertzel_frame(f, GOERTZEL_FREQS, SR))
+
+    mfcc_arr = np.array(mfcc_seq, dtype=np.float32)   # (n_frames, 13)
+    goer_arr = np.array(goertzel_seq, dtype=np.float32) # (n_frames, 16)
+
+    # CMN on MFCCs only
+    mfcc_arr -= np.mean(mfcc_arr, axis=0, keepdims=True)
+
+    # Delta MFCCs
+    n     = mfcc_arr.shape[0]
+    delta = np.zeros_like(mfcc_arr)
+    for t in range(n):
+        delta[t] = (mfcc_arr[min(t+1,n-1)] - mfcc_arr[max(t-1,0)]) / 2.0
+
+    # Normalise Goertzel to zero-mean per utterance (same CMN idea)
+    goer_arr -= np.mean(goer_arr, axis=0, keepdims=True)
+
+    mfcc_feat = np.concatenate([mfcc_arr, delta], axis=1)  # (n_frames, 26)
+    goer_feat = goer_arr * GOERTZEL_W                       # (n_frames, 16)
+
+    return np.concatenate([mfcc_feat, goer_feat], axis=1)  # (n_frames, 42)
+
+# ---------------------------------------------------
+# DTW — Sakoe-Chiba band
 # ---------------------------------------------------
 def dtw_distance(a, b):
     n, m = len(a), len(b)
@@ -85,77 +146,35 @@ def dtw_distance(a, b):
 # ---------------------------------------------------
 # CLASSIFIERS
 # ---------------------------------------------------
-
 def classify_1nn(dists, labels):
-    """Baseline: single nearest neighbour."""
     return labels[np.argmin(dists)]
 
-
 def classify_class_mean_top3(dists, labels):
-    """
-    Per-class: average the 3 closest templates of each class.
-    More stable than 1-NN — one outlier recording can't win alone.
-    """
-    class_dists = defaultdict(list)
-    for d, lbl in zip(dists, labels):
-        class_dists[lbl].append(d)
-
-    class_score = {}
-    for lbl, ds in class_dists.items():
-        top3 = sorted(ds)[:3]
-        class_score[lbl] = np.mean(top3)
-
-    return min(class_score, key=class_score.get), class_score
-
+    cd = defaultdict(list)
+    for d, lbl in zip(dists, labels): cd[lbl].append(d)
+    cs = {lbl: np.mean(sorted(ds)[:3]) for lbl, ds in cd.items()}
+    return min(cs, key=cs.get), cs
 
 def classify_weighted_knn_normalized(dists, labels, k=K):
-    """
-    Weighted k-NN where each class's total weight is divided by
-    the number of templates it has — removes the sample-count bias.
-    """
-    top_idx    = np.argsort(dists)[:k]
-    top_labels = labels[top_idx]
-    top_dists  = dists[top_idx]
-
-    # count templates per class (for normalisation)
-    class_counts = defaultdict(int)
-    for lbl in labels:
-        class_counts[lbl] += 1
-
-    # accumulate inverse-distance weights, then normalise by class size
-    raw_votes = defaultdict(float)
-    for lbl, d in zip(top_labels, top_dists):
-        raw_votes[lbl] += 1.0 / (d + 1e-9)
-
-    norm_votes = {lbl: score / class_counts[lbl]
-                  for lbl, score in raw_votes.items()}
-
-    return max(norm_votes, key=norm_votes.get), norm_votes
-
+    top_idx = np.argsort(dists)[:k]
+    cc = defaultdict(int)
+    for lbl in labels: cc[lbl] += 1
+    rv = defaultdict(float)
+    for i in top_idx: rv[labels[i]] += 1.0 / (dists[i] + 1e-9)
+    nv = {lbl: score / cc[lbl] for lbl, score in rv.items()}
+    return max(nv, key=nv.get), nv
 
 def classify_ensemble(dists, labels, k=K):
-    """
-    Run all three classifiers and take majority vote.
-    Ties broken by lowest per-class mean distance.
-    """
-    p1 = classify_1nn(dists, labels)
-    p2, scores2 = classify_class_mean_top3(dists, labels)
-    p3, scores3 = classify_weighted_knn_normalized(dists, labels, k)
-
-    predictions = [p1, p2, p3]
-    vote_count  = defaultdict(int)
-    for p in predictions:
-        vote_count[p] += 1
-
-    max_votes = max(vote_count.values())
-    winners   = [lbl for lbl, v in vote_count.items() if v == max_votes]
-
-    if len(winners) == 1:
-        return winners[0], vote_count, predictions
-
-    # tie-break: pick winner with best class_mean_top3 score
-    tiebreak = min(winners, key=lambda lbl: scores2.get(lbl, float('inf')))
-    return tiebreak, vote_count, predictions
+    p1           = classify_1nn(dists, labels)
+    p2, scores2  = classify_class_mean_top3(dists, labels)
+    p3, _        = classify_weighted_knn_normalized(dists, labels, k)
+    vc = defaultdict(int)
+    for p in [p1, p2, p3]: vc[p] += 1
+    mx      = max(vc.values())
+    winners = [lbl for lbl, v in vc.items() if v == mx]
+    if len(winners) == 1: return winners[0], vc, [p1, p2, p3]
+    tb = min(winners, key=lambda lbl: scores2.get(lbl, float('inf')))
+    return tb, vc, [p1, p2, p3]
 
 # ---------------------------------------------------
 # RECORD
@@ -168,33 +187,29 @@ print("Processing...\n")
 # ---------------------------------------------------
 # EXTRACT + CLASSIFY
 # ---------------------------------------------------
-query = extract_mfcc_seq(audio)
+query = extract_seq(audio)
 dists = np.array([dtw_distance(query, t) for t in templates])
 
-# Run all classifiers
-p1                  = classify_1nn(dists, labels)
-p2, class_scores    = classify_class_mean_top3(dists, labels)
-p3, norm_votes      = classify_weighted_knn_normalized(dists, labels, K)
-final, vote_count, preds = classify_ensemble(dists, labels, K)
+p1                   = classify_1nn(dists, labels)
+p2, class_scores     = classify_class_mean_top3(dists, labels)
+p3, norm_votes       = classify_weighted_knn_normalized(dists, labels, 10)
+final, vote_count, _ = classify_ensemble(dists, labels, K)
 
-# ---------------------------------------------------
-# PRINT RESULTS
-# ---------------------------------------------------
 top_k = np.argsort(dists)[:K]
 print(f"Top {K} nearest neighbours:")
 for i in top_k:
     print(f"  {labels[i]:25s}  dist={dists[i]:.4f}")
 
-print("\nPer-class mean of top-3 distances:")
+print("\nPer-class mean of top-3:")
 for lbl, s in sorted(class_scores.items(), key=lambda x: x[1]):
     print(f"  {lbl:25s}  score={s:.4f}")
 
-print("\nNormalised weighted k-NN scores:")
+print("\nNormalised weighted k-NN:")
 for lbl, s in sorted(norm_votes.items(), key=lambda x: -x[1]):
-    print(f"  {lbl:25s}  score={s:.4f}")
+    print(f"  {lbl:25s}  score={s:.6f}")
 
 print("\n" + "="*50)
-print(f"  1-NN result          : {p1}")
+print(f"  1-NN                 : {p1}")
 print(f"  Class mean top-3     : {p2}")
 print(f"  Normalised k-NN      : {p3}")
 print(f"  ENSEMBLE (final)     : {final}   [{vote_count[final]}/3 votes]")
